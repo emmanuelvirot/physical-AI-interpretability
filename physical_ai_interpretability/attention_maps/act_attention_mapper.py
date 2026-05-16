@@ -143,10 +143,27 @@ class ACTPolicyWithAttention:
                 else:
                     img_tensor_batched = img_tensor
 
-                img_tensor_batched = img_tensor_batched.to(next(self.policy.model.vision_encoder.resnet_feature_extractor.parameters()).device)
+                if hasattr(self.policy.model, "vision_encoder"):
+                    backbone = self.policy.model.vision_encoder.resnet_feature_extractor
+                elif hasattr(self.policy.model, "backbone"):
+                    backbone = self.policy.model.backbone
+                elif hasattr(self.policy.model, "backbones"):
+                    backbone = next(iter(self.policy.model.backbones.values()))
+                else:
+                    raise AttributeError(
+                        f"Could not find ACT vision backbone. Available model attrs: {list(self.policy.model._modules.keys())}"
+                    )
 
-                feature_map_dict = self.policy.model.vision_encoder.resnet_feature_extractor(img_tensor_batched) # Use batched tensor
-                feature_map = feature_map_dict["feature_map"]
+                img_tensor_batched = img_tensor_batched.to(next(backbone.parameters()).device)
+                feature_map_output = backbone(img_tensor_batched)
+
+                if isinstance(feature_map_output, dict):
+                    feature_map = feature_map_output.get("feature_map")
+                    if feature_map is None:
+                        feature_map = next(iter(feature_map_output.values()))
+                else:
+                    feature_map = feature_map_output
+
                 h, w = feature_map.shape[2], feature_map.shape[3]
                 spatial_shapes.append((h, w))
 

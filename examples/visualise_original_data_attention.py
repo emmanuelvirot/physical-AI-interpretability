@@ -8,34 +8,25 @@ By default, analyzes all episodes in the dataset.
 
 import argparse
 import os
+import sys
 import time
 import subprocess
+from pathlib import Path
 from typing import Dict, Tuple
 
+import cv2
 import numpy as np
 import torch
 from tqdm import tqdm
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
-from lerobot.policies.factory import make_policy, make_pre_post_processors
+from lerobot.policies.factory import get_policy_class, make_pre_post_processors
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.utils.import_utils import register_third_party_plugins
-from robocandywrapper.factory import make_dataset_without_config
 # from robocandywrapper.dataformats.lerobot_21 import LeRobot21Dataset as LeRobotDataset
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from physical_ai_interpretability.attention_maps import ACTPolicyWithAttention
-
-
-TRAIN_DATASET_REPO_IDS = [
-    "villekuosmanen/build_block_tower",
-    "villekuosmanen/dAgger_build_block_tower_1.0.0",
-    "villekuosmanen/dAgger_build_block_tower_1.1.0",
-    "villekuosmanen/dAgger_build_block_tower_1.2.0",
-    "villekuosmanen/dAgger_build_block_tower_1.3.0",
-    "villekuosmanen/dAgger_build_block_tower_1.4.0",
-    "villekuosmanen/fail_build_block_tower_stationary",
-    "villekuosmanen/fail_build_block_tower_autonomous_interaction",
-]
 
 
 def none_or_int(value):
@@ -90,6 +81,24 @@ def encode_video_ffmpeg(frames, output_filename, fps, pix_fmt_in="bgr24"):
     except Exception as e:
         print(f"An unexpected error occurred during video encoding for {output_filename}: {e}")
 
+
+def create_combined_attention_frame(frames):
+    valid_frames = [frame for frame in frames if frame is not None]
+    if len(valid_frames) < 2:
+        return None
+
+    common_height = min(frame.shape[0] for frame in valid_frames)
+    resized_frames = []
+    for frame in valid_frames:
+        height, width = frame.shape[:2]
+        if height != common_height:
+            scale = common_height / height
+            frame = cv2.resize(frame, (int(width * scale), common_height))
+        resized_frames.append(frame)
+
+    return np.hstack(resized_frames)
+
+
 def load_policy(policy_path: str, dataset_meta, policy_overrides: list = None) -> Tuple[torch.nn.Module, dict]:
     """Load and initialize a policy from checkpoint."""
     
@@ -105,8 +114,11 @@ def load_policy(policy_path: str, dataset_meta, policy_overrides: list = None) -
         policy_cfg = PreTrainedConfig.from_pretrained(policy_path)
         policy_cfg.pretrained_path = policy_path
 
-    # NOTE: policy has to be an ACT policy for this to work
-    policy = make_policy(policy_cfg, ds_meta=dataset_meta)
+    # NOTE: policy has to be an ACT policy for this to work.
+    # Load directly from the checkpoint config so dataset metadata cannot resize
+    # the action head and break state_dict loading.
+    policy_cls = get_policy_class(policy_cfg.type)
+    policy = policy_cls.from_pretrained(policy_path, config=policy_cfg)
         # Create processors - only provide dataset_stats if not resuming from saved processors
     processor_kwargs = {}
     postprocessor_kwargs = {}
@@ -200,6 +212,10 @@ def prepare_observation_for_policy(frame: dict,
             # Proprioceptive state
             if not isinstance(value, torch.Tensor):
                 value = torch.from_numpy(value).type(model_dtype)
+            if value.dtype != model_dtype:
+                value = value.type(model_dtype)
+            if value.dim() == 1:
+                value = value.unsqueeze(0)
             observation[key] = value.to(device)
     
     return observation
@@ -246,7 +262,7 @@ def analyze_episode(dataset: LeRobotDataset,
                 image_feature_names = [str(image_features)]
             print(f"Image features: {image_feature_names}")
         else:
-            print(f"Image features: None")
+            print("Image features: None")
             
         # Handle robot state feature
         robot_state_feature = getattr(policy.config, 'robot_state_feature', None)
@@ -254,7 +270,7 @@ def analyze_episode(dataset: LeRobotDataset,
             robot_state_name = getattr(robot_state_feature, 'name', str(robot_state_feature))
             print(f"Robot state feature: {robot_state_name}")
         else:
-            print(f"Robot state feature: None")
+            print("Robot state feature: None")
             
         print(f"Env state feature: {getattr(policy.config, 'env_state_feature', 'None')}")
         print(f"Chunk size: {getattr(policy.config, 'chunk_size', 'None')}")
@@ -299,12 +315,10 @@ def analyze_episode(dataset: LeRobotDataset,
                             else:
                                 valid_frames_this_step.append(None)
                         
-                        # Create side-by-side frame
-                        if len(valid_frames_this_step) == num_cameras and all(f is not None for f in valid_frames_this_step):
-                            first_height = valid_frames_this_step[0].shape[0]
-                            if all(f.shape[0] == first_height for f in valid_frames_this_step):
-                                side_by_side_frame = np.hstack(valid_frames_this_step)
-                                side_by_side_buffer.append(side_by_side_frame)
+                        # Create side-by-side frame from any 2+ valid camera views.
+                        side_by_side_frame = create_combined_attention_frame(valid_frames_this_step)
+                        if side_by_side_frame is not None:
+                            side_by_side_buffer.append(side_by_side_frame)
                 else:
                     action = result
                     
@@ -330,9 +344,11 @@ def analyze_episode(dataset: LeRobotDataset,
                 output_filename = f"{output_dir}/attention_ep{episode_id}_cam{i}_{timestamp_str}.mp4"
                 encode_video_ffmpeg(cam_buffer, output_filename, dataset.fps)
         
-        # if side_by_side_buffer:
-        output_filename_sbs = f"{output_dir}/attention_ep{episode_id}_combined_{timestamp_str}.mp4"
-        encode_video_ffmpeg(side_by_side_buffer, output_filename_sbs, dataset.fps)
+        if side_by_side_buffer:
+            output_filename_sbs = f"{output_dir}/attention_ep{episode_id}_combined_{timestamp_str}.mp4"
+            encode_video_ffmpeg(side_by_side_buffer, output_filename_sbs, dataset.fps)
+        else:
+            print("No combined attention video written: fewer than two valid camera views were available per frame.")
     
     # Analyze and save importance results
     analysis_results = {
@@ -402,10 +418,9 @@ def main():
     # Load policy
     try:
         print("Loading policy...")
-        train_dataset = make_dataset_without_config(TRAIN_DATASET_REPO_IDS)
         policy, policy_cfg = load_policy(
             args.policy_path,
-            train_dataset.meta,
+            dataset.meta,
             args.policy_overrides
         )
         
@@ -448,7 +463,7 @@ def main():
     
     # Summary
     print(f"\n{'='*60}")
-    print(f"ANALYSIS SUMMARY")
+    print("ANALYSIS SUMMARY")
     print(f"{'='*60}")
     print(f"Successfully analyzed: {len(all_results)} episodes")
     if failed_episodes:
