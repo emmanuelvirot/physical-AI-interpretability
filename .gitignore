@@ -179,3 +179,6 @@ cython_debug/
 wandb
 output
 **/feature_analysis_results
+
+# specific to macOS
+.DS_Store
