@@ -182,3 +182,6 @@ output
 
 # specific to macOS
 .DS_Store
+
+# specific debug notes
+# 2026-05*
