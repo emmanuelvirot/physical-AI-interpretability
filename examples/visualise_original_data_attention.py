@@ -243,8 +243,8 @@ def analyze_episode(dataset: LeRobotDataset,
     print(f"Analyzing episode {episode_id} with {episode_length} frames")
     
     # Initialize storage for results
-    attention_videos = None
-    side_by_side_buffer = []
+    attention_videos = {}
+    side_by_side_buffer = {}
     actions_predicted = []
     actions_ground_truth = []
     timestamps = []
@@ -293,24 +293,30 @@ def analyze_episode(dataset: LeRobotDataset,
                     # ACT policy with attention
                     action, attention_maps = result
                     
-                    # Generate attention visualizations
-                    visualizations = policy.visualize_attention(
+                    # Generate attention visualizations. The attention mapper returns
+                    # one entry per observed decoder cross-attention layer.
+                    visualizations_by_layer = policy.visualize_attention(
                         attention_maps=attention_maps, 
                         observation=observation,
                     )
+                    if not isinstance(visualizations_by_layer, dict):
+                        visualizations_by_layer = {"default": visualizations_by_layer}
                     
-                    # Initialize video buffers on first frame
-                    if attention_videos is None and visualizations:
-                        num_cameras = len(visualizations)
-                        attention_videos = [[] for _ in range(num_cameras)]
-                        print(f"Detected {num_cameras} camera views for attention visualization")
-                    
-                    # Store attention frames
-                    if attention_videos is not None:
+                    # Store attention frames for each observed decoder layer.
+                    for layer_label, visualizations in visualizations_by_layer.items():
+                        if layer_label not in attention_videos:
+                            num_cameras = len(visualizations)
+                            attention_videos[layer_label] = [[] for _ in range(num_cameras)]
+                            side_by_side_buffer[layer_label] = []
+                            print(
+                                f"Detected {num_cameras} camera views for '{layer_label}' "
+                                "attention visualization"
+                            )
+
                         valid_frames_this_step = []
                         for j, vis in enumerate(visualizations):
-                            if vis is not None and j < len(attention_videos):
-                                attention_videos[j].append(vis.copy())
+                            if vis is not None and j < len(attention_videos[layer_label]):
+                                attention_videos[layer_label][j].append(vis.copy())
                                 valid_frames_this_step.append(vis.copy())
                             else:
                                 valid_frames_this_step.append(None)
@@ -318,7 +324,7 @@ def analyze_episode(dataset: LeRobotDataset,
                         # Create side-by-side frame from any 2+ valid camera views.
                         side_by_side_frame = create_combined_attention_frame(valid_frames_this_step)
                         if side_by_side_frame is not None:
-                            side_by_side_buffer.append(side_by_side_frame)
+                            side_by_side_buffer[layer_label].append(side_by_side_frame)
                 else:
                     action = result
                     
@@ -339,16 +345,25 @@ def analyze_episode(dataset: LeRobotDataset,
     
     # Save attention videos
     if attention_videos:
-        for i, cam_buffer in enumerate(attention_videos):
-            if cam_buffer:
-                output_filename = f"{output_dir}/attention_ep{episode_id}_cam{i}_{timestamp_str}.mp4"
-                encode_video_ffmpeg(cam_buffer, output_filename, dataset.fps)
-        
-        if side_by_side_buffer:
-            output_filename_sbs = f"{output_dir}/attention_ep{episode_id}_combined_{timestamp_str}.mp4"
-            encode_video_ffmpeg(side_by_side_buffer, output_filename_sbs, dataset.fps)
-        else:
-            print("No combined attention video written: fewer than two valid camera views were available per frame.")
+        for layer_label, layer_buffers in attention_videos.items():
+            for i, cam_buffer in enumerate(layer_buffers):
+                if cam_buffer:
+                    output_filename = (
+                        f"{output_dir}/attention_ep{episode_id}_{layer_label}_cam{i}_{timestamp_str}.mp4"
+                    )
+                    encode_video_ffmpeg(cam_buffer, output_filename, dataset.fps)
+            
+            combined_buffer = side_by_side_buffer.get(layer_label, [])
+            if combined_buffer:
+                output_filename_sbs = (
+                    f"{output_dir}/attention_ep{episode_id}_{layer_label}_combined_{timestamp_str}.mp4"
+                )
+                encode_video_ffmpeg(combined_buffer, output_filename_sbs, dataset.fps)
+            else:
+                print(
+                    f"No combined '{layer_label}' attention video written: "
+                    "fewer than two valid camera views were available per frame."
+                )
     
     # Analyze and save importance results
     analysis_results = {

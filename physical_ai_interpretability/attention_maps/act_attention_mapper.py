@@ -49,7 +49,41 @@ class ACTPolicyWithAttention:
         not hasattr(self.policy.model.decoder, 'layers') or \
         not self.policy.model.decoder.layers:
             raise AttributeError("Policy model structure does not match expected ACT architecture for target_layer.")
-        self.target_layer = self.policy.model.decoder.layers[-1].multihead_attn
+        if not hasattr(self.policy.model, 'encoder') or \
+        not hasattr(self.policy.model.encoder, 'layers') or \
+        not self.policy.model.encoder.layers:
+            raise AttributeError("Policy model structure does not match expected ACT architecture for encoder layers.")
+
+        self.encoder_layer_count = len(self.policy.model.encoder.layers)
+        self.decoder_layer_count = len(self.policy.model.decoder.layers)
+        self.target_layers = {
+            "encoder_first": self.policy.model.encoder.layers[0].self_attn,
+            "default": self.policy.model.decoder.layers[-1].multihead_attn,
+        }
+        self.target_layer_types = {
+            "encoder_first": "encoder_self",
+            "default": "decoder_cross",
+        }
+        if self.decoder_layer_count > 1:
+            self.target_layers["decoder_first"] = self.policy.model.decoder.layers[0].multihead_attn
+            self.target_layer_types["decoder_first"] = "decoder_cross"
+
+        print(
+            "ACT encoder self-attention layers available: "
+            f"{self.encoder_layer_count}. Capturing encoder_first layer (index 0)."
+        )
+        if self.decoder_layer_count == 1:
+            print(
+                "ACT decoder cross-attention layers available: 1. "
+                "The first and default final decoder layers are the same module, "
+                "so only 'default' decoder attention will be written."
+            )
+        else:
+            print(
+                "ACT decoder cross-attention layers available: "
+                f"{self.decoder_layer_count}. Capturing decoder_first layer (index 0) "
+                f"and default final layer (index {self.decoder_layer_count - 1})."
+            )
         
     def select_action(self, observation: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor, List[np.ndarray]]:
         """
@@ -69,28 +103,28 @@ class ACTPolicyWithAttention:
         images = self._extract_images(observation)
         image_spatial_shapes = self._get_image_spatial_shapes(images)
         
-        # Set up hook to capture attention weights
-        attention_weights_capture = []
+        # Set up hooks to capture attention weights from selected decoder cross-attention layers.
+        attention_weights_capture = {label: [] for label in self.target_layers}
         
-        def attention_hook(module, input_args, output_tuple):
-            # Capture the attention weights
-            # In some MultiheadAttention implementations, the attention weights
-            # might be returned with shape: [batch_size, tgt_len, src_len]
-            # or [batch_size, num_heads, tgt_len, src_len]
-            if isinstance(output_tuple, tuple) and len(output_tuple) > 1:
-                # If output is a tuple with attention weights as second element
-                attn_weights = output_tuple[1]
-            else:
-                # If output format is different, try to get weights from the module directly
-                # Some implementations store attention weights in the module after forward pass
-                attn_weights = getattr(module, 'attn_weights', None)
-            
-            if attn_weights is not None:
-                # Store the weights regardless of shape - we'll handle reshape later
-                attention_weights_capture.append(attn_weights.detach().cpu())
+        def make_attention_hook(label):
+            def attention_hook(module, input_args, output_tuple):
+                # Capture the attention weights. In some MultiheadAttention implementations,
+                # attention weights may have shape [batch, tgt_len, src_len] or
+                # [batch, heads, tgt_len, src_len].
+                if isinstance(output_tuple, tuple) and len(output_tuple) > 1:
+                    attn_weights = output_tuple[1]
+                else:
+                    attn_weights = getattr(module, 'attn_weights', None)
+                
+                if attn_weights is not None:
+                    attention_weights_capture[label].append(attn_weights.detach().cpu())
+
+            return attention_hook
         
-        # Register the hook
-        handle = self.target_layer.register_forward_hook(attention_hook)
+        handles = [
+            layer.register_forward_hook(make_attention_hook(label))
+            for label, layer in self.target_layers.items()
+        ]
         
         # Call the original policy's select_action
         observation = self.preprocessor(observation)
@@ -100,20 +134,32 @@ class ACTPolicyWithAttention:
                 action, _ = action
             self.policy.reset()
         
-        # Remove the hook
-        handle.remove()
+        for handle in handles:
+            handle.remove()
                 
         # Process the attention weights
-        if attention_weights_capture:
-            attn = attention_weights_capture[0].to(action.device)
-            attention_maps, proprio_attention = self._map_attention_to_images(attn, image_spatial_shapes)
-            self.last_attention_maps = attention_maps
-            self.last_proprio_attention = proprio_attention  # Store for visualization
-        else:
-            print("Warning: No attention weights were captured.")
-            attention_maps = [None] * self.num_images
-            self.last_attention_maps = attention_maps
-            self.last_proprio_attention = 0.0  # Store for visualization
+        attention_maps = {}
+        proprio_attention = {}
+        for label, captures in attention_weights_capture.items():
+            if captures:
+                attn = captures[0].to(action.device)
+                if self.target_layer_types[label] == "encoder_self":
+                    layer_attention_maps, layer_proprio_attention = self._map_encoder_attention_to_images(
+                        attn, image_spatial_shapes
+                    )
+                else:
+                    layer_attention_maps, layer_proprio_attention = self._map_attention_to_images(
+                        attn, image_spatial_shapes
+                    )
+                attention_maps[label] = layer_attention_maps
+                proprio_attention[label] = layer_proprio_attention
+            else:
+                print(f"Warning: No attention weights were captured for '{label}' layer.")
+                attention_maps[label] = [None] * self.num_images
+                proprio_attention[label] = 0.0
+
+        self.last_attention_maps = attention_maps
+        self.last_proprio_attention = proprio_attention  # Store for visualization
             
         return action, attention_maps
 
@@ -335,6 +381,103 @@ class ACTPolicyWithAttention:
             final_normalized_attention_maps.append(normalized_map)
 
         return final_normalized_attention_maps, normalized_proprio_attention
+
+    def _map_encoder_attention_to_images(self,
+                                         attention: torch.Tensor,
+                                         image_spatial_shapes: List[Tuple[int, int]]) -> Tuple[List[np.ndarray], float]:
+        """Map encoder self-attention to image regions.
+
+        Encoder self-attention has observation tokens as both queries and sources.
+        For visualization we average over all query tokens and map attention paid
+        to each image-token region back to that camera's feature map.
+        """
+        if attention.dim() == 4:
+            attention = attention.mean(dim=1)  # -> [batch, tgt_len, src_len]
+        elif attention.dim() != 3:
+            raise ValueError(f"Unexpected encoder attention dimension: {attention.shape}. Expected 3 or 4.")
+
+        n_prefix_tokens = 1  # latent token
+        proprio_token_idx = None
+        if self.config.robot_state_feature:
+            proprio_token_idx = n_prefix_tokens
+            n_prefix_tokens += 1
+        if self.config.env_state_feature:
+            n_prefix_tokens += 1
+
+        proprio_attention = 0.0
+        if proprio_token_idx is not None:
+            proprio_attention = attention[:, :, proprio_token_idx].mean(dim=1)[0].cpu().numpy().item()
+
+        raw_numpy_attention_maps = []
+        tokens_per_image = [h * w for h, w in image_spatial_shapes]
+        current_src_token_idx = n_prefix_tokens
+
+        for i, (h_feat, w_feat) in enumerate(image_spatial_shapes):
+            if h_feat == 0 or w_feat == 0:
+                raw_numpy_attention_maps.append(None)
+                current_src_token_idx += tokens_per_image[i]
+                continue
+
+            num_img_tokens = tokens_per_image[i]
+            start_idx = current_src_token_idx
+            end_idx = start_idx + num_img_tokens
+            current_src_token_idx = end_idx
+
+            # Average over all encoder query tokens, keeping source image tokens.
+            img_attn_tensor_for_map = attention[:, :, start_idx:end_idx].mean(dim=1)
+
+            if img_attn_tensor_for_map.shape[1] != num_img_tokens:
+                print(
+                    f"Warning (map_encoder_attention): Mismatch in token count for image {i}. "
+                    f"Expected {num_img_tokens}, got {img_attn_tensor_for_map.shape[1]}. Skipping map."
+                )
+                raw_numpy_attention_maps.append(None)
+                continue
+
+            try:
+                raw_numpy_attention_maps.append(
+                    img_attn_tensor_for_map[0].reshape(h_feat, w_feat).cpu().numpy()
+                )
+            except RuntimeError as e:
+                print(
+                    f"Error (map_encoder_attention): Reshaping attention for image {i}: {e}. "
+                    f"Shape was {img_attn_tensor_for_map[0].shape}, target HxW: {h_feat}x{w_feat}."
+                )
+                raw_numpy_attention_maps.append(None)
+
+        global_min = float('inf')
+        global_max = float('-inf')
+        found_any_valid_map = False
+
+        if proprio_attention is not None:
+            global_min = min(global_min, proprio_attention)
+            global_max = max(global_max, proprio_attention)
+            found_any_valid_map = True
+
+        for raw_map_np in raw_numpy_attention_maps:
+            if raw_map_np is not None:
+                global_min = min(global_min, raw_map_np.min())
+                global_max = max(global_max, raw_map_np.max())
+                found_any_valid_map = True
+
+        if not found_any_valid_map:
+            return raw_numpy_attention_maps, 0.0
+
+        if global_max > global_min:
+            normalized_proprio_attention = (proprio_attention - global_min) / (global_max - global_min)
+        else:
+            normalized_proprio_attention = 0.0
+
+        final_normalized_attention_maps = []
+        for raw_map_np in raw_numpy_attention_maps:
+            if raw_map_np is None:
+                final_normalized_attention_maps.append(None)
+            elif global_max > global_min:
+                final_normalized_attention_maps.append((raw_map_np - global_min) / (global_max - global_min))
+            else:
+                final_normalized_attention_maps.append(np.zeros_like(raw_map_np, dtype=np.float32))
+
+        return final_normalized_attention_maps, normalized_proprio_attention
     
     def visualize_attention(self, 
                         images: Optional[List[torch.Tensor]] = None, 
@@ -343,7 +486,8 @@ class ACTPolicyWithAttention:
                         use_rgb: bool = False,
                         overlay_alpha: float = 0.5,
                         show_proprio_border: bool = True,
-                        proprio_border_width: int = 15) -> List[np.ndarray]:
+                        proprio_border_width: int = 15,
+                        proprio_attention: Optional[float] = None) -> List[np.ndarray]:
         """
         Create visualizations by overlaying attention maps on images.
         
@@ -373,8 +517,26 @@ class ACTPolicyWithAttention:
             else:
                 raise ValueError("No attention maps provided and no stored attention maps available")
 
+        if isinstance(attention_maps, dict):
+            return {
+                label: self.visualize_attention(
+                    images=images,
+                    attention_maps=layer_attention_maps,
+                    observation=None,
+                    use_rgb=use_rgb,
+                    overlay_alpha=overlay_alpha,
+                    show_proprio_border=show_proprio_border,
+                    proprio_border_width=proprio_border_width,
+                    proprio_attention=getattr(self, 'last_proprio_attention', {}).get(label, 0.0),
+                )
+                for label, layer_attention_maps in attention_maps.items()
+            }
+
         # Get proprioception attention value
-        proprio_attention = getattr(self, 'last_proprio_attention', 0.0)                
+        if proprio_attention is None:
+            proprio_attention = getattr(self, 'last_proprio_attention', 0.0)
+            if isinstance(proprio_attention, dict):
+                proprio_attention = proprio_attention.get("default", 0.0)
         visualizations = []
         
         for i, (img, attn_map) in enumerate(zip(images, attention_maps)):
